@@ -106,7 +106,7 @@ Connectors belong to your Claude account, so it also appears in the Claude mobil
 
 ## Limitations
 
-- **Read-only.** The Personal API can't push workouts to your watch.
+- **Read-only.** The Personal API can't push workouts to your watch. Claude can still schedule them through a calendar connector such as Google Calendar, building custom workouts on the fly from your recent metrics.
 - **No Garmin analytics.** Training status, training readiness, VO2 max, and race predictions aren't in the Personal API. Claude works from the raw data.
 - **HRV needs a supported watch** (the original Forerunner 945 doesn't record it).
 - **One person per deployment.** A Personal API key reaches only its owner's data.
