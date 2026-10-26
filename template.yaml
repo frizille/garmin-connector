@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  garmin-connector v1 -- private, read-only Garmin Connect MCP connector for Claude
+  (Garmin Personal API, GitHub sign-in allowlisted to one account).
+
+Parameters:
+  AllowedGitHubLogin:
+    Type: String
+    MinLength: 1
+    Description: The only GitHub account allowed to sign in (your GitHub username).
+  AllowedGitHubId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional but recommended -- that account's numeric GitHub user ID (from
+      https://api.github.com/users/<login>). Pins the allowlist even if the login is renamed and re-registered.
+  LocalTimezone:
+    Type: String
+    Default: America/New_York
+    Description: Time zone used for "today" in date defaults.
+  WebAdapterLayerVersion:
+    Type: Number
+    Default: 30
+    Description: Version of AWS's public Lambda Web Adapter layer (arm64).
+
+Resources:
+  # One secret holds everything. CloudFormation generates master_key; you fill in
+  # the three REPLACE_ME values after deploying (see README). Nothing secret is
+  # ever passed as a template parameter.
+  # DO NOT EDIT the GenerateSecretString block after the first deploy: any change
+  # regenerates the whole secret, wiping your filled-in values and the master key.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/app'
+      Description: garmin-connector -- Garmin Personal API key, GitHub OAuth app, master key
+      GenerateSecretString:
+        SecretStringTemplate: '{"garmin_api_key":"REPLACE_ME","github_client_id":"REPLACE_ME","github_client_secret":"REPLACE_ME"}'
+        GenerateStringKey: master_key
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # OAuth client registrations and token mappings (values encrypted by the app).
+  OAuthTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: collection, AttributeType: S }
+        - { AttributeName: key, AttributeType: S }
+      KeySchema:
+        - { AttributeName: collection, KeyType: HASH }
+        - { AttributeName: key, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ConnectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: garmin-connector v1
+      CodeUri: package/
+      Handler: run.sh
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 512
+      Timeout: 29
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:${WebAdapterLayerVersion}'
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          PORT: '8000'
+          AWS_LWA_READINESS_CHECK_PATH: /healthz
+          HOME: /tmp
+          SECRET_ARN: !Ref AppSecret
+          OAUTH_TABLE: !Ref OAuthTable
+          PUBLIC_BASE_URL: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+          ALLOWED_GITHUB_LOGIN: !Ref AllowedGitHubLogin
+          ALLOWED_GITHUB_ID: !Ref AllowedGitHubId
+          LOCAL_TIMEZONE: !Ref LocalTimezone
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AppSecret
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OAuthTable
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:DescribeTimeToLive
+              Resource: !GetAtt OAuthTable.Arn
+      LoggingConfig:
+        LogGroup: !Ref ConnectorLogs
+
+  ConnectorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  # API Gateway (HTTP API), defined explicitly so the function can know its own
+  # public URL without a circular dependency.
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ConnectorFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:   # caps cost if someone hammers the URL
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  HttpApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConnectorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+Outputs:
+  ConnectorUrl:
+    Description: Paste this into claude.ai -> Settings -> Connectors -> Add custom connector
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp'
+  GitHubCallbackUrl:
+    Description: Authorization callback URL for your GitHub OAuth app
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/auth/callback'
+  HomepageUrl:
+    Description: Homepage URL for your GitHub OAuth app
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  SecretName:
+    Description: Secrets Manager secret to fill in
+    Value: !Sub '${AWS::StackName}/app'
+  FunctionName:
+    Description: Lambda function (used to force a reload after editing the secret)
+    Value: !Ref ConnectorFunction

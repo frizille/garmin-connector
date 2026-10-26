@@ -1,0 +1,5 @@
+fastmcp==3.4.11
+garmin-personal-mcp==0.1.1
+garmin-connect-personal-api-python==1.0.0
+py-key-value-aio[dynamodb]==0.4.6
+uvicorn==0.54.0
